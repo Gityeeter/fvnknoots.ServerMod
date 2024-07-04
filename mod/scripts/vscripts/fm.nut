@@ -116,9 +116,9 @@ struct {
     bool switchEnabled
     int switchDiff
     int switchLimit
-    bool switchKill
     table<string, int> switchCountTable
 
+    bool balanceOnJoin
     bool balanceEnabled
     float balancePercentage
     int balanceMinPlayers
@@ -151,6 +151,7 @@ struct {
     bool statsEnabled
     string statsHost
     string nutoneServerId
+    table<string, float> nutonePlayerKds
 
     bool hpEnabled
     table<entity, int> hpPlayers
@@ -296,10 +297,10 @@ void function fm_Init() {
     file.switchEnabled = GetConVarBool("fm_switch_enabled")
     file.switchDiff = GetConVarInt("fm_switch_diff")
     file.switchLimit = GetConVarInt("fm_switch_limit")
-    file.switchKill = GetConVarBool("fm_switch_kill")
     file.switchCountTable = {}
 
     // balance
+    file.balanceOnJoin = GetConVarBool("fm_balance_on_join")
     file.balanceEnabled = GetConVarBool("fm_balance_enabled")
     file.balancePercentage = GetConVarFloat("fm_balance_percentage")
     file.balanceMinPlayers = GetConVarInt("fm_balance_min_players")
@@ -336,6 +337,7 @@ void function fm_Init() {
     file.statsEnabled = GetConVarBool("fm_stats_enabled")
     file.statsHost = GetConVarString("fm_stats_host")
     file.nutoneServerId = GetConVarString("nutone_server_id")
+    file.nutonePlayerKds = {}
 
     // hp
     file.hpEnabled = GetConVarBool("fm_hp_enabled")
@@ -720,6 +722,10 @@ void function fm_Init() {
 
     if (file.switchEnabled && !IsFFAGame()) {
         file.commands.append(cmdSwitch)
+    }
+
+    if (file.balanceOnJoin && !IsFFAGame()) {
+        AddCallback_OnClientConnected(BalanceOnJoin_OnClientConnected)
     }
 
     if (file.balanceEnabled && !IsFFAGame()) {
@@ -1817,7 +1823,7 @@ bool function CommandSwitch(entity player, array<string> args) {
     }
 
     // ctf
-    if (!file.switchKill && PlayerHasEnemyFlag(target)) {
+    if (PlayerHasEnemyFlag(target)) {
         SendMessage(player, ErrorColor(flagMsg))
         return false
     }
@@ -1843,11 +1849,6 @@ bool function CommandSwitch(entity player, array<string> args) {
 
     if (!isAdminSwitch) {
         file.switchCountTable[targetUid] <- switchCount
-    }
-
-    // ctf: if player is holding a flag, he gotta die *before* setting the team
-    if (!isAdminSwitch && file.switchKill && IsAlive(target)) {
-        target.Die()
     }
 
     if (isAdminSwitch) {
@@ -1905,10 +1906,32 @@ void function DoBalance() {
     }
 
     array<PlayerScore> scores = GetPlayerScores(switchablePlayers)
-    for (int i = 0; i < scores.len(); i++) {
-        entity player = scores[i].player
-        int oldTeam = player.GetTeam()
-        int newTeam = IsEven(i) ? TEAM_IMC : TEAM_MILITIA
+
+    float imcScore = 0.0
+    int imcCount = 0
+    float militiaScore = 0.0
+    int militiaCount = 0
+
+    for (int i = 0; i < players.len(); i++) {
+        int newTeam = imcCount <= militiaCount ? TEAM_IMC : TEAM_MILITIA
+        PlayerScore playerScore
+        if (newTeam == TEAM_IMC) {
+            playerScore = imcScore <= militiaScore ? scores.remove(0) : scores.pop()
+        } else {
+            playerScore = militiaScore <= imcScore ? scores.remove(0) : scores.pop()
+        }
+
+        entity player = playerScore.player
+        float score = playerScore.val
+
+        if (newTeam == TEAM_IMC) {
+            imcScore += score
+            imcCount += 1
+        } else {
+            militiaScore += score
+            militiaCount += 1
+        }
+
         SetTeam(player, newTeam)
     }
 
@@ -1916,7 +1939,7 @@ void function DoBalance() {
         RecalculatePvPTeamScores()
     }
 
-    string msg = "teams have been rebalanced"
+    string msg = "teams have been rebalanced by k/d (data from Nutone API if found)"
     AnnounceMessage(AnnounceColor(msg))
     if (GetGameState() < eGameState.Postmatch) {
         AnnounceInfoMessage(msg)
@@ -1987,8 +2010,13 @@ float function CalculateKillScore(entity player) {
     float ad = float(assists) / float(deaths)
     float assistWeight = 0.5 // -50% importance for assists
 
-    //return kd + (ad * assistWeight) // OLD
-    return float(kills) - float(deaths)
+    float ingameScore = kd + (ad * assistWeight)
+    string uid = player.GetUID()
+    if (uid in file.nutonePlayerKds) { 
+        return (file.nutonePlayerKds[uid] + ingameScore) / 2.0 // average between nutone data and match data
+    }
+
+    return ingameScore
 }
 
 int function PlayerScoreSort(PlayerScore a, PlayerScore b) {
@@ -2001,6 +2029,36 @@ int function PlayerScoreSort(PlayerScore a, PlayerScore b) {
 
 void function Balance_Postmatch() {
     DoBalance()
+}
+
+void function BalanceOnJoin_OnClientConnected(entity player) {
+    int sourceTeam = player.GetTeam()
+    int otherTeam = GetOtherTeam(sourceTeam)
+
+    array<entity> sourceTeamPlayers = GetPlayerArrayOfTeam(sourceTeam)
+    array<entity> otherTeamPlayers = GetPlayerArrayOfTeam(otherTeam)
+
+    int sourceTeamCount = sourceTeamPlayers.len()
+    int otherTeamCount = otherTeamPlayers.len()
+
+    int sourceTeamKills = 0
+    int otherTeamKills = 0
+    foreach (entity p in sourceTeamPlayers) {
+        sourceTeamKills += p.GetPlayerGameStat(PGS_KILLS)
+    }
+
+    foreach (entity p in otherTeamPlayers) {
+        otherTeamKills += player.GetPlayerGameStat(PGS_KILLS)
+    }
+
+    // new game
+    if (sourceTeamKills == 0 && otherTeamKills == 0) {
+        return
+    }
+
+    if (sourceTeamCount > otherTeamCount && sourceTeamKills > otherTeamKills) {
+        SetTeam(player, otherTeam)
+    }
 }
 
 void function Balance_OnClientDisconnected(entity player) {
@@ -2310,13 +2368,14 @@ bool function CommandStats(entity player, array<string> args) {
             if ("uid" in responseTable) {
                 uid = expect string(responseTable["uid"])
             }
-
-            if ("kills" in responseTable) {
-                kills = expect int(responseTable["kills"])
-            }
-
-            if ("deaths" in responseTable) {
-                deaths = expect int(responseTable["deaths"])
+            
+            if ("total" in responseTable){
+                if ("kills" in expect table(responseTable["total"])) {
+                    kills = expect int(expect table(responseTable["total"])["kills"])
+                }
+                if ("deaths" in expect table(responseTable["total"])) {
+                    deaths = expect int(expect table(responseTable["total"])["deaths"])
+                }
             }
 
             // TODO: figure out how to extract float
@@ -2332,6 +2391,7 @@ bool function CommandStats(entity player, array<string> args) {
             }
 
             float kd = kills / max(deaths, 1)
+            file.nutonePlayerKds[uid] <- kd // Store for !teambalance
             string msg = format("%s %d kills and %d deaths (%.2f K/D)", prefix, kills, deaths, kd)
             SendMessage(player, PrivateColor(msg))
         } else {

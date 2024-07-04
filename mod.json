@@ -191,9 +191,9 @@
             "DefaultValue": "3"
         },
 
-        // 1 = kills the player using !switch (to prevent abuse)
+        // 1 = put newly players on weaker team if team sizes are equal
         {
-            "Name": "fm_switch_kill",
+            "Name": "fm_balance_on_join",
             "DefaultValue": "1"
         },
 
